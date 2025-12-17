@@ -1,0 +1,736 @@
+---
+title: "Prediction model for ictus"
+format: html
+editor: visual
+---
+
+Judith Cendrero, Óscar López and Ivan Labrandero
+
+# 0. Dataset preparation
+
+```{r}
+library(tidyverse)
+library(dplyr)
+library(stringr)
+library(forcats)
+library(ggplot2)
+library(tidyr)
+library(purrr)
+
+data_path <- "Dataset 2 (bueno)/dataset.csv"   # ruta relativa (misma carpeta)
+df <- read.csv(data_path)
+```
+
+## Dataset exploration
+
+```{r}
+dim(df)
+head(df)
+names(df)
+```
+
+```{r}
+str(df)
+```
+
+```{r}
+df <- df %>%
+  rename(
+    residence         = Residence_type,
+    BMI               = bmi
+  )
+
+str(df)
+```
+
+## NA (missing data)
+
+```{r}
+na_table <- data.frame(
+  variable = names(df),
+  n_missing = sapply(df, function(x) sum(is.na(x)))
+)
+
+na_table[order(-na_table$n_missing), ]
+```
+
+## Changes in variables
+
+```{r}
+# Binary output variable
+df$stroke <- factor(
+  df$stroke,
+  levels = c(0, 1),
+  labels = c("No", "Yes")
+)
+
+# Eliminate variables not used in the model
+df <- df %>%
+  select(-id)
+
+# Convert some variables to numeric
+df$BMI <- as.numeric(df$BMI)
+
+# Convert strings to factors
+df <- df %>%
+  mutate(across(where(is.character), as.factor))
+
+# Binary variables (0/1) -> factor (No/Yes)
+df <- df %>%
+  mutate(
+    hypertension   = factor(hypertension, levels = c(0,1), labels = c("No","Yes")),
+    heart_disease  = factor(heart_disease, levels = c(0,1), labels = c("No","Yes"))
+  )
+
+# NA 2nd check
+anyNA(df)
+colSums(is.na(df))
+```
+
+```{r}
+
+# Median attribution to NA values
+df$BMI[is.na(df$BMI)] <- median(df$BMI, na.rm = TRUE)
+anyNA(df)
+colSums(is.na(df))
+```
+
+## Train/Test split
+
+```{r}
+set.seed(123)
+
+# Stratified split (80/20)
+idx_yes <- which(df$stroke == "Yes")
+idx_no  <- which(df$stroke == "No")
+
+train_idx <- c(
+  sample(idx_yes, size = floor(0.8 * length(idx_yes))),
+  sample(idx_no,  size = floor(0.8 * length(idx_no)))
+)
+
+train_df <- df[train_idx, ]
+test_df  <- df[-train_idx, ]
+
+# Stroke distribution (No/Yes) in training/test
+prop.table(table(df$stroke))
+prop.table(table(train_df$stroke))
+prop.table(table(test_df$stroke))
+```
+
+## Exploratory data analysis (EDA)
+
+```{r}
+library(fitdistrplus)
+
+par(mar = c(5, 5, 4, 8))
+
+vars_cf <- c(
+  "age",
+  "avg_glucose_level",
+  "BMI"
+)
+
+for (v in vars_cf) {
+
+  cat("\n\n### Variable:", v, "\n")
+
+  # Cullen & Frey plot
+  descdist(train_df[[v]], boot = 100)
+}
+```
+
+The Cullen and Frey analysis shows that age has a nearly symmetric distribution with moderate kurtosis, making it broadly compatible with a normal or logistic distribution. In contrast, average glucose level exhibits clear positive skewness and increased kurtosis, suggesting a right-tailed distribution such as lognormal or gamma. BMI presents even stronger right skewness and high kurtosis, indicating heavy tails and the presence of extreme values. For both glucose and BMI, the assumption of normality may not be appropriate. These findings support the use of variable transformations (e.g. logarithmic) or flexible, non-linear modeling approaches such as GAM.
+
+```{r}
+library(dplyr)
+library(GGally)
+
+set.seed(123)
+plot_df <- train_df %>% sample_n(min(1500, n()))
+
+GGally::ggpairs(
+  plot_df,
+  columns = c("age", "BMI", "avg_glucose_level"),
+  mapping = ggplot2::aes(color = stroke),
+  upper = list(continuous = GGally::wrap("cor", size = 3)),
+  lower = list(continuous = GGally::wrap("points", alpha = 0.15, size = 0.4)),
+  diag  = list(continuous = GGally::wrap("densityDiag", alpha = 0.3))
+)
+
+```
+
+The pairwise analysis shows that age, BMI, and average glucose level are positively correlated overall, although the strength of these associations is moderate. When stratified by outcome, age exhibits a clear separation between stroke and non-stroke groups, suggesting a strong discriminative role. In contrast, BMI and glucose display substantial overlap between classes. This overlap indicates limited additional predictive value beyond age, specially for BMI. Consequently, even though these variables are associated with stroke, their marginal contribution to model performance is suggested to be modest.
+
+```{r}
+library(ggplot2)
+
+# Age
+ggplot(train_df, aes(x = stroke, y = age, fill = stroke)) +
+  geom_boxplot(alpha = 0.6) +
+  theme_minimal() +
+  labs(title = "Age by stroke status")
+
+# BMI (log-transformed)
+ggplot(train_df, aes(x = stroke, y = log(BMI), fill = stroke)) +
+  geom_boxplot(alpha = 0.6) +
+  theme_minimal() +
+  labs(title = "Log(BMI) by stroke status")
+
+# Average glucose level (log-transformed)
+ggplot(train_df, aes(x = stroke, y = log(avg_glucose_level), fill = stroke)) +
+  geom_boxplot(alpha = 0.6) +
+  theme_minimal() +
+  labs(title = "Log(avg_glucose_level) by stroke status")
+
+```
+
+The boxplots highlight a clear separation in age between individuals with and without stroke, with stroke cases being markedly older on average and showing limited overlap with the non-stroke group. In contrast, log-transformed BMI exhibits very similar medians and substantial overlap between classes, indicating weak discriminative power despite transformation. A similar pattern is observed for log-transformed average glucose level, although in this case stroke cases tend to have slightly higher values but with wide dispersion and strong overlap. These visual results suggest that age is the dominant predictor, glucose levels might contribute moderately to the model while BMI contribution is marginal. This suggests transforming BMI and glucose might not translate into improved model performance.
+
+```{r}
+# Hypertension
+ggplot(train_df, aes(x = hypertension, fill = stroke)) +
+  geom_bar(position = "fill") +
+  theme_minimal() +
+  labs(y = "Proportion", title = "Stroke proportion by hypertension")
+
+# Heart disease
+ggplot(train_df, aes(x = heart_disease, fill = stroke)) +
+  geom_bar(position = "fill") +
+  theme_minimal() +
+  labs(y = "Proportion", title = "Stroke proportion by heart disease")
+
+# Gender
+ggplot(train_df, aes(x = gender, fill = stroke)) +
+  geom_bar(position = "fill") +
+  theme_minimal() +
+  labs(y = "Proportion", title = "Stroke proportion by gender")
+
+```
+
+The plots indicate that stroke prevalence is notably higher among individuals with hypertension and those with heart disease, compared to those without these conditions, suggesting a role of these variables as clinical risk factors for stroke. In contrast, gender shows minimal differences in stroke proportion, with similar rates observed for males and females. The “Other” gender category presents no stroke cases, likely reflecting a very small sample size rather than a true absence of risk. Overall, although these categorical variables display associations with stroke at a univariate level, their discriminative power seems weaker than that of age.
+
+# 1. Model construction
+
+## Model V1 (only some 2nd-order interactions, no log variables)
+
+```{r}
+model_null <- glm(
+  stroke ~ 1,
+  data = train_df,
+  family = binomial
+)
+
+model_full <- glm(
+  stroke ~
+    age +
+    BMI +
+    avg_glucose_level +
+    hypertension +
+    heart_disease +
+    gender +
+    smoking_status +
+    ever_married +
+    work_type +
+    residence +
+
+    # Possible clinical interactions
+    age:hypertension +
+    age:heart_disease +
+    gender:age +
+    hypertension:heart_disease,
+  data = train_df,
+  family = binomial
+)
+
+model_step <- step(
+  model_null,
+  scope = list(
+    lower = model_null,
+    upper = model_full
+  ),
+  direction = "both",   # o "forward"
+  trace = TRUE
+)
+summary(model_step)
+```
+
+Model 1 identifies age, average glucose level, and hypertension as the main predictors of stroke. As expected, age shows the strongest association, with increasing age markedly raising the odds of stroke. Average glucose level has a smaller but statistically significant positive effect, indicating higher stroke risk with increasing glucose. Hypertension is also significantly associated with stroke, with hypertensive individuals having higher odds compared to non-hypertensive ones. The substantial reduction from null deviance to residual deviance, together with a low AIC, indicates a clear improvement over the null model, although most of the explanatory power is driven by age.
+
+## Model V2 (all 2nd-order interactions, log variables)
+
+```{r}
+train_df_v2 <- train_df %>%
+  mutate(
+    log_glucose = log(avg_glucose_level),
+    log_BMI     = log(BMI)
+  )
+
+model_null_v2 <- glm(
+  stroke ~ 1,
+  family = binomial,
+  data = train_df_v2
+)
+
+model_full_v2 <- glm(
+  stroke ~ 
+    age +
+    log_glucose +
+    log_BMI +
+    hypertension +
+    heart_disease +
+    gender +
+    smoking_status +
+    ever_married +
+    work_type +
+    residence +
+    age:gender +
+    age:log_glucose +
+    age:log_BMI,
+  family = binomial,
+  data = train_df_v2
+)
+
+model_step_v2 <- step(
+  model_null_v2,
+  scope = list(
+    lower = model_null_v2,
+    upper = model_full_v2
+  ),
+  direction = "both",
+  trace = TRUE
+)
+
+summary (model_step_v2)
+```
+
+Model 2 replaces raw average glucose level with its logarithmic transformation while retaining age and hypertension as predictors. Although log(glucose) is statistically significant, the overall model fit is slightly worse, as reflected by the higher AIC (1259.1 vs. 1258.1) and marginally higher residual deviance. This indicates that the log transformation of glucose does not improve explanatory power relative to the original scale. Overall, Model 1 is therefore preferred on model selection criteria, despite both models yielding very similar inference.
+
+## Model V3 (all 2nd-order interactions, no log variables)
+
+```{r}
+model_null_v3 <- glm(
+  stroke ~ 1,
+  family = binomial,
+  data = train_df
+)
+
+model_full_v3 <- glm(
+  stroke ~ (age + gender + hypertension + heart_disease +
+            avg_glucose_level + BMI + smoking_status +
+            ever_married + work_type + residence)^2,
+  family = binomial,
+  data = train_df
+)
+
+model_step_v3 <- step(
+  model_null_v3,
+  scope = list(
+    lower = ~1,
+    upper = formula(model_full_v3)
+  ),
+  direction = "both",
+  trace = TRUE
+)
+
+summary(model_step_v3)
+```
+
+Model 3, which allowed all second-order interactions in the applied stepwise selection, converged to the same final model as Model 1, retaining age, average glucose level, and hypertension as predictors. No interaction terms were selected, indicating that pairwise interactions between variables do not provide additional explanatory value beyond main effects. Model fit metrics (residual deviance and AIC) are identical to those of Model 1, confirming that an increased model complexity does not improve performance. This suggests that the relationship between these predictors and stroke risk is largely additive and dominated by age.
+
+# 2. Test and evaluation metrics
+
+```{r}
+
+# Test and stroke prediction (P(stroke = "Yes"))
+test_prob <- predict(model_step_v3, newdata = test_df, type = "response")
+
+test_df$pred_prob <- test_prob
+
+# ROC + AUC 
+
+library(pROC)         
+roc_obj <- roc(
+  response  = test_df$stroke,
+  predictor = test_df$pred_prob,
+  levels    = c("No", "Yes"),
+  quiet     = TRUE
+)
+
+auc_val <- as.numeric(auc(roc_obj))              
+auc_ci  <- ci.auc(roc_obj)                      
+auc_val
+auc_ci
+
+plot(roc_obj, main = paste0("ROC (TEST) - AUC = ", round(auc_val, 3)))
+abline(a = 0, b = 1, lty = 2)
+
+# Cutoff 0.1 
+cutoff <- 0.1
+test_pred <- ifelse(test_df$pred_prob >= cutoff, "Yes", "No") |>
+  factor(levels = c("No","Yes"))
+
+test_df$pred_class <- test_pred
+
+# Confusion matrix 
+tab <- table(Actual = test_df$stroke, Predicho = test_df$pred_class)
+tab
+
+TP <- tab["Yes","Yes"]; TN <- tab["No","No"]
+FP <- tab["No","Yes"];  FN <- tab["Yes","No"]
+
+accuracy    <- (TP + TN) / sum(tab)
+sensitivity <- TP / (TP + FN)
+specificity <- TN / (TN + FP)
+
+metrics_cut01 <- data.frame(
+  cutoff = cutoff,
+  accuracy = accuracy,
+  sensitivity = sensitivity,
+  specificity = specificity,
+  TP = TP, TN = TN, FP = FP, FN = FN
+)
+metrics_cut01
+
+# Optimal cutoff (Youden) 
+best_youden <- coords(
+  roc_obj, x = "best", best.method = "youden",
+  ret = c("threshold","sensitivity","specificity"),
+  transpose = FALSE
+)
+best_youden
+
+cutoff_youden <- as.numeric(best_youden["threshold"])  
+test_pred_youden <- ifelse(test_df$pred_prob >= cutoff_youden, "Yes", "No") |>
+  factor(levels = c("No","Yes"))
+
+tab_youden <- table(Actual = test_df$stroke, Predicho = test_pred_youden)
+tab_youden
+
+TPy <- tab_youden["Yes","Yes"]; TNy <- tab_youden["No","No"]
+FPy <- tab_youden["No","Yes"];  FNy <- tab_youden["Yes","No"]
+
+accuracy_y    <- (TPy + TNy) / sum(tab_youden)
+sensitivity_y <- TPy / (TPy + FNy)
+specificity_y <- TNy / (TNy + FPy)
+
+metrics_youden <- data.frame(
+  cutoff = cutoff_youden,
+  accuracy = accuracy_y,
+  sensitivity = sensitivity_y,
+  specificity = specificity_y,
+  TP = TPy, TN = TNy, FP = FPy, FN = FNy
+)
+metrics_youden
+
+# Model v3 vs null model (baseline) comparison
+
+null_prob <- predict(model_null_v3, newdata = test_df, type = "response")
+
+roc_null <- roc(
+  test_df$stroke,
+  null_prob,
+  levels = c("No", "Yes"),
+  quiet = TRUE
+)
+
+auc_null <- as.numeric(auc(roc_null))
+
+data.frame(
+  AUC_modelo_final = auc_val,
+  AUC_modelo_nulo  = auc_null,
+  delta_AUC        = auc_val - auc_null
+)
+
+# Save model
+saveRDS(model_step_v3, file = "model_v3.rds")
+```
+
+On the test set, the model shows good discriminative ability, with an AUC of 0.80 (95% CI: 0.75–0.85), clearly outperforming the null model (AUC = 0.50; ΔAUC ≈ 0.30). Using a low cutoff (0.1) yields high specificity (≈0.86) but only moderate sensitivity (≈0.48), whereas the Youden-optimal threshold (\~0.04) substantially increases sensitivity to 0.82 at the cost of reduced specificity (≈0.69). This trade-off is appropriate for a screening context, where minimizing false negatives is prioritized over false positives. Overall, the model provides a robust balance between discrimination and sensitivity, supporting its use as a screening tool for identifying individuals at higher stroke risk rather than for definitive diagnosis.
+
+## Model calibration (for screening)
+
+```{r}
+library(rms)
+
+y_test <- ifelse(test_df$stroke == "Yes", 1, 0)
+
+val.prob(
+  p = test_df$pred_prob,
+  y = y_test,
+  m = 10   
+)
+```
+
+The model is good at ranking people from lower to higher stroke risk, but it is less accurate at predicting the exact probability of having a stroke. It tends to overestimate risk, especially for people it classifies as high risk. On average, however, the prediction errors are small, and the model performs well in the low-risk range, where most individuals lie. This makes the model appropriate for screening, where the goal is to identify higher-risk individuals, but not ideal for giving precise individual risk percentages without further recalibration.
+
+# 3. Alternative approaches
+
+## LASSO
+
+```{r}
+library(glmnet)
+
+y_train <- ifelse(train_df$stroke == "Yes", 1, 0)
+
+# Train matrix
+X_train <- model.matrix(
+  stroke ~ age + gender + hypertension + heart_disease +
+    avg_glucose_level + BMI + smoking_status +
+    ever_married + work_type + residence,
+  data = train_df
+)[, -1]
+
+# Cross-validation LASSO
+
+set.seed(123)
+
+cv_lasso <- cv.glmnet(
+  x = X_train,
+  y = y_train,
+  family = "binomial",
+  alpha = 1,        
+  nfolds = 10,
+  type.measure = "deviance"
+)
+
+cv_lasso$lambda.min
+cv_lasso$lambda.1se
+
+# Final model LASSO
+
+lasso_model <- glmnet(
+  x = X_train,
+  y = y_train,
+  family = "binomial",
+  alpha = 1,
+  lambda = cv_lasso$lambda.min
+)
+
+# Coefficients
+coef(lasso_model)
+plot(cv_lasso)
+```
+
+```{r}
+# Test and evaluation
+
+# Test matrix
+X_test <- model.matrix(
+  stroke ~ age + gender + hypertension + heart_disease +
+    avg_glucose_level + BMI + smoking_status +
+    ever_married + work_type + residence,
+  data = test_df
+)[, -1]
+
+# Test and stroke prediction 
+
+test_prob_lasso <- as.numeric(predict(lasso_model, newx = X_test, type = "response"))
+
+test_df$pred_prob_lasso <- test_prob_lasso
+
+# ROC + AUC 
+
+library(pROC)
+
+roc_lasso <- roc(
+  response  = test_df$stroke,
+  predictor = test_df$pred_prob_lasso,
+  levels    = c("No","Yes"),
+  quiet     = TRUE
+)
+
+auc_lasso <- as.numeric(auc(roc_lasso))
+auc_ci_lasso <- ci.auc(roc_lasso)
+
+auc_lasso
+auc_ci_lasso
+
+plot(roc_lasso, main = paste0("ROC LASSO (TEST) - AUC = ", round(auc_lasso, 3)))
+abline(a = 0, b = 1, lty = 2)
+
+# Cutoff 0.1
+
+cutoff_fixed <- 0.1
+pred_class_lasso_01 <- ifelse(test_df$pred_prob_lasso >= cutoff_fixed, "Yes", "No") |>
+  factor(levels = c("No","Yes"))
+
+tab_lasso_01 <- table(Actual = test_df$stroke, Predicho = pred_class_lasso_01)
+tab_lasso_01
+
+TP <- tab_lasso_01["Yes","Yes"]; TN <- tab_lasso_01["No","No"]
+FP <- tab_lasso_01["No","Yes"];  FN <- tab_lasso_01["Yes","No"]
+
+metrics_lasso_01 <- data.frame(
+  model = "LASSO",
+  cutoff = cutoff_fixed,
+  accuracy = (TP + TN) / sum(tab_lasso_01),
+  sensitivity = TP / (TP + FN),
+  specificity = TN / (TN + FP),
+  TP = TP, TN = TN, FP = FP, FN = FN
+)
+metrics_lasso_01
+
+# Optimal cutoff óptimo (Youden) 
+
+best_youden_lasso <- coords(
+  roc_lasso, x = "best", best.method = "youden",
+  ret = c("threshold","sensitivity","specificity"),
+  transpose = FALSE
+)
+best_youden_lasso
+
+cutoff_youden_lasso <- as.numeric(best_youden_lasso["threshold"])
+
+pred_class_lasso_y <- ifelse(test_df$pred_prob_lasso >= cutoff_youden_lasso, "Yes", "No") |>
+  factor(levels = c("No","Yes"))
+
+tab_lasso_y <- table(Actual = test_df$stroke, Predicho = pred_class_lasso_y)
+tab_lasso_y
+
+TPy <- tab_lasso_y["Yes","Yes"]; TNy <- tab_lasso_y["No","No"]
+FPy <- tab_lasso_y["No","Yes"];  FNy <- tab_lasso_y["Yes","No"]
+
+metrics_lasso_youden <- data.frame(
+  model = "LASSO",
+  cutoff = cutoff_youden_lasso,
+  accuracy = (TPy + TNy) / sum(tab_lasso_y),
+  sensitivity = TPy / (TPy + FNy),
+  specificity = TNy / (TNy + FPy),
+  TP = TPy, TN = TNy, FP = FPy, FN = FNy
+)
+metrics_lasso_youden
+
+# Summary
+
+list(
+  AUC_LASSO = auc_lasso,
+  AUC_CI_LASSO = auc_ci_lasso,
+  Metrics_cutoff_0_1 = metrics_lasso_01,
+  Metrics_Youden = metrics_lasso_youden
+)
+
+# Save model
+saveRDS(lasso_model, file = "lasso_model.rds")
+```
+
+The LASSO model shows virtually the same performance as the initial stepwise logistic model, with an AUC of 0.80 vs 0.799, indicating equivalent discrimination. Sensitivity and specificity are also very similar at both the fixed cutoff and the Youden-optimal threshold. The key advantage of LASSO is that it yields a simpler, more stable model by removing less relevant variables while maintaining the same predictive ability, making it equally suitable for screening.
+
+## GAM
+
+```{r}
+
+# GAM (logistic)
+
+library(mgcv)
+
+# GAM: soften numeric variables (age, avg_glucose_level, BMI)
+gam_model <- gam(
+  stroke ~
+    s(age, k = 5) +
+    s(avg_glucose_level, k = 5) +
+    s(BMI, k = 5) +
+    gender + hypertension + heart_disease +
+    smoking_status + ever_married + work_type + residence,
+  data = train_df,
+  family = binomial(link = "logit"),
+  method = "REML",
+  select = TRUE
+)
+
+summary(gam_model)
+
+par(mfrow = c(1,3))
+plot(gam_model, shade = TRUE, pages = 1)
+par(mfrow = c(1,1))
+```
+
+```{r}
+# Test and evaluation
+
+# Test and stroke prediction 
+test_prob_gam <- predict(gam_model, newdata = test_df, type = "response")
+test_df$pred_prob_gam <- test_prob_gam
+
+# ROC + AUC 
+library(pROC)
+
+roc_gam <- roc(
+  response  = test_df$stroke,
+  predictor = test_df$pred_prob_gam,
+  levels    = c("No","Yes"),
+  quiet     = TRUE
+)
+
+auc_gam <- as.numeric(auc(roc_gam))
+auc_ci_gam <- ci.auc(roc_gam)
+
+auc_gam
+auc_ci_gam
+
+plot(roc_gam, main = paste0("ROC GAM (TEST) - AUC = ", round(auc_gam, 3)))
+abline(a = 0, b = 1, lty = 2)
+
+# Cutoff 0.1 
+cutoff_fixed <- 0.1
+pred_class_gam_01 <- ifelse(test_df$pred_prob_gam >= cutoff_fixed, "Yes", "No") |>
+  factor(levels = c("No","Yes"))
+
+tab_gam_01 <- table(Actual = test_df$stroke, Predicho = pred_class_gam_01)
+tab_gam_01
+
+TP <- tab_gam_01["Yes","Yes"]; TN <- tab_gam_01["No","No"]
+FP <- tab_gam_01["No","Yes"];  FN <- tab_gam_01["Yes","No"]
+
+metrics_gam_01 <- data.frame(
+  model = "GAM",
+  cutoff = cutoff_fixed,
+  accuracy = (TP + TN) / sum(tab_gam_01),
+  sensitivity = TP / (TP + FN),
+  specificity = TN / (TN + FP),
+  TP = TP, TN = TN, FP = FP, FN = FN
+)
+metrics_gam_01
+
+# Optimal cutoff (Youden)
+best_youden_gam <- coords(
+  roc_gam, x = "best", best.method = "youden",
+  ret = c("threshold","sensitivity","specificity"),
+  transpose = FALSE
+)
+best_youden_gam
+
+cutoff_youden_gam <- as.numeric(best_youden_gam["threshold"])
+
+pred_class_gam_y <- ifelse(test_df$pred_prob_gam >= cutoff_youden_gam, "Yes", "No") |>
+  factor(levels = c("No","Yes"))
+
+tab_gam_y <- table(Actual = test_df$stroke, Predicho = pred_class_gam_y)
+tab_gam_y
+
+TPy <- tab_gam_y["Yes","Yes"]; TNy <- tab_gam_y["No","No"]
+FPy <- tab_gam_y["No","Yes"];  FNy <- tab_gam_y["Yes","No"]
+
+metrics_gam_youden <- data.frame(
+  model = "GAM",
+  cutoff = cutoff_youden_gam,
+  accuracy = (TPy + TNy) / sum(tab_gam_y),
+  sensitivity = TPy / (TPy + FNy),
+  specificity = TNy / (TNy + FPy),
+  TP = TPy, TN = TNy, FP = FPy, FN = FNy
+)
+metrics_gam_youden
+
+# Summary
+list(
+  AUC_GAM = auc_gam,
+  AUC_CI_GAM = auc_ci_gam,
+  Metrics_cutoff_0_1 = metrics_gam_01,
+  Metrics_Youden = metrics_gam_youden
+)
+
+# Save model
+saveRDS(gam_model, file = "gam_model.rds")
+```
+
+The GAM also performs very similarly to the initial logistic model. Discrimination is unchanged, with an AUC of about 0.80 and overlapping confidence intervals. At a fixed cutoff of 0.1, sensitivity (\~0.48) and specificity (\~0.85) are almost identical, while the Youden-optimal cutoff increases sensitivity (\~0.82) at the cost of lower specificity (\~0.69), reflecting the same trade-off as before. The main advantage of the GAM is interpretability, revealing non-linear effects of age and average glucose level, but it does not improve overall predictive performance.
