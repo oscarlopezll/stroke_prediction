@@ -1,0 +1,19 @@
+services:
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+
+  shiny:
+    platform: linux/amd64
+    build:
+      context: ./shiny
+      dockerfile: Dockerfile
+    ports:
+      - "3838:3838"
+    environment:
+      - API_BASE=http://api:8000
+    depends_on:
+      - api
