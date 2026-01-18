@@ -1,0 +1,17 @@
+services:
+  api:
+    image: ivanlg95/archivosdocker-api:v1
+    ports:
+      - "8000:8000"
+
+  shiny:
+    image: ivanlg95/archivosdocker-shiny:v1
+    platform: linux/amd64 
+    ports:
+      - "3838:3838"
+    environment:
+      - API_BASE=http://api:8000
+    depends_on:
+      - api
+
+
